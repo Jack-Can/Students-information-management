@@ -1,16 +1,11 @@
 package main
 
-import (
-	"student/dbservice"
-	"student/router"
-)
-
 func main() {
-	if err := dbservice.InitDB(); err != nil {
+	if err := InitDB(); err != nil {
 		panic("Failed to connect to the database")
 	}
-	defer dbservice.CloseDB()
+	defer CloseDB()
 
-	router := router.SetupRouter()
+	router := SetupRouter()
 	router.Run(":8080")
 }
