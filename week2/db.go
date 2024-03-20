@@ -1,12 +1,17 @@
 package main
 
 import (
-	// "database/sql"
+	"context"
+	"encoding/json"
+
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -14,8 +19,8 @@ import (
 
 var dsn = "root:jack_040604@tcp(127.0.0.1:3306)/db01?charset=utf8"
 
-// var Mysqldb *sql.DB
 var db *gorm.DB
+var rdb *redis.Client
 
 type Student struct {
 	ID   int    `json:"id"`
@@ -23,53 +28,136 @@ type Student struct {
 	Age  int    `json:"age"`
 }
 
+// 错误处理封装
+func HandleError(c *gin.Context, err error, message string) {
+	log.Printf("%s: %v", message, err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": message})
+}
+
+// Redis缓存处理(读)
+func RedisCacheGetId(c *gin.Context) (*Student, error) {
+	id := c.Param("id")
+	// 先查看Json里面有无数据
+	studentbt, err := rdb.Get(c.Request.Context(), id).Bytes()
+	if err != nil {
+		if err != redis.Nil {
+			// 如果发生了除缓存不存在以外的其他错误，则返回500错误
+			HandleError(c, err, "Failed to retrieve data from cache")
+			return nil, fmt.Errorf("failed to retrieve data from cache")
+		}
+		// 到MySQL中查找
+		student, err := FindInMysql(id, c)
+		// 未找到则返回错误
+		if err != nil {
+			return nil, err
+		}
+		if student == nil {
+			return nil, nil
+		}
+		// 缓存到Redis中
+		if _, err := AddToRedisCache(student, id); err != nil {
+			return nil, err
+		}
+		return student, nil
+	}
+	var student Student
+	err = json.Unmarshal(studentbt, &student)
+	if err != nil {
+		return nil, err
+	}
+	return &student, nil
+
+}
+
+// 缓存Redis
+func AddToRedisCache(student *Student, id string) (*Student, error) {
+	studentJSON, err := json.Marshal(student)
+	if err != nil {
+		return student, err
+	}
+	if err := rdb.Set(context.Background(), id, studentJSON, time.Hour).Err(); err != nil {
+		HandleError(nil, err, "Failed to cache data in Redis")
+		return nil, err
+	}
+	return student, nil
+}
+
+// 删除Redis中的缓存
+func DeletRedis(c *gin.Context) error {
+	if err := rdb.Del(context.Background(), c.Param("id")).Err(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Failed to Delete data in Redis"})
+		return err
+	}
+	return nil
+}
+
+// 在MySQL中查找数据
+func FindInMysql(id string, c *gin.Context) (*Student, error) {
+	var student *Student
+	studentID, _ := strconv.Atoi(id)
+	// fmt.Println(id)
+	if err := db.First(&student, studentID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		HandleError(c, err, "Database query error")
+		return nil, err
+	}
+	return student, nil
+}
+
 func InitDB() error {
-	var err error
-	//初始化Mysql连接池
-	// Mysqldb, err = sql.Open("mysql", dsn)
-	// if err != nil {
-	// 	log.Fatalf("Failed to connect MySQL:%v", err)
-	// }
-
-	// if err := Mysqldb.Ping(); err != nil {
-	// 	log.Fatalf("Failed to Ping MySQL:%v", err)
-	// }
-
 	//使用gorm建立Mysql连接池
+	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("Failed to connect to MySQL:%v", err)
 	}
-	// Mysqldb,err =db.DB()
+	Mysqldb, _ := db.DB()
+	if err := Mysqldb.Ping(); err != nil {
+		log.Fatalf("Failed to Ping MySQL:%v", err)
+	}
+	fmt.Println("MySQL sucessfully connect")
+	Mysqldb.SetMaxOpenConns(64)
+	Mysqldb.SetMaxIdleConns(64)
+	Mysqldb.SetConnMaxLifetime(5 * time.Minute)
+
+	//初始化Redis连接池
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+	// defer rdb.Close()
+	Pong, err := rdb.Ping(context.Background()).Result()
+	if err != nil {
+		log.Fatalf("failed to ping Redis:%v", err)
+	}
+	fmt.Println("Redis Ping Response:", Pong)
 	return nil
+}
+
+// 判断id
+func JudgeId(c *gin.Context) int {
+	studentID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "invalid student ID"})
+		return 0
+	}
+	return studentID
 }
 func GetAllStudents() ([]Student, error) {
 	var students []Student
-	/*
-		// Mysqldb.Query("SELECT id, name, age FROM students") 这行代码执行了一个 SELECT 查询，从名为 "students" 的表中检索所有学生的 ID、姓名和年龄信息。查询的结果被存储在 rows 变量中，以供后续使用。
-		// if err := Mysqldb.Find(&students).Error(); err != nil {
-		// 	return nil, err
-		// }
-		// rows, err := Mysqldb.Query("SELECT id, name, age FROM students")
-		// if err != nil {
-		// 	return nil, err
-		// }
-		// defer rows.Close()
-		// 当所有行都被遍历完成后，您需要调用 rows.Close() 来关闭结果集
-
-		// 迭代查询结果集中的每一行
-		for rows.Next() {
-			var student Student
-			// rows.Scan() 方法会根据传入的参数列表，依次从当前行中读取每个列的值，并将这些值分别赋给相应的变量。
-			if err := rows.Scan(&student.ID, &student.Name, &student.Age); err != nil {
-				return nil, err
-			}
-			students = append(students, student)
-		}
-	*/
 	if err := db.Find(&students).Error; err != nil {
 		// Find(&students) 用于从数据库中检索所有的学生信息，并将结果存储到 students 变量中
 		return nil, err
+	}
+	// 将所有学生数据缓存到Redis缓存中
+	for _, student := range students {
+		_, err := AddToRedisCache(&student, strconv.Itoa(student.ID))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return students, nil
 }
@@ -77,7 +165,7 @@ func GetAllStudents() ([]Student, error) {
 func ListAllStudents(c *gin.Context) {
 	students, err := GetAllStudents()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		HandleError(c, err, "Failed to get all students")
 		return
 	}
 
@@ -90,16 +178,9 @@ func AddStudent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	/*
-		//  SQL 插入语句，将学生的姓名和年龄插入到名为 students 的表中(序号更新问题需要到这里来解决)
-		_, err := Mysqldb.Exec("INSERT INTO students (name, age) VALUES (?, ?)", student.Name, student.Age)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	*/
+
 	if err := db.Create(&student).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		HandleError(c, err, "Failed to add student to database")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "sucessfully added"})
@@ -107,30 +188,9 @@ func AddStudent(c *gin.Context) {
 
 // GetStudentByID 获取单个学生信息
 func GetStudentById(c *gin.Context) {
-	// studentid := c.Param("id")
-	// c.Param("id") 用于获取 URL 中的参数值。
-	// id := strconv.Atoi()
-	// 函数正是用于将字符串转换为整数的。
-	// var student Student
-	studentID, err := strconv.Atoi(c.Param("id"))
-	// _, err := strconv.Atoi(c.Param("id"))
+	student, err := RedisCacheGetId(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "No find"})
-	}
-	/*
-		// Mysqldb.QueryRow: 使用给定的 SQL 查询语句执行一次查询，并期望返回最多一行结果。
-		// 该方法返回的是一个 *Row 对象，表示查询的结果集中的一行。
-		row := Mysqldb.QueryRow("SELECT id, name, age FROM students WHERE id = ?", studentID)
-		// 这一行代码用于将查询结果中的列值扫描到指定的变量中。
-		if err := row.Scan(&student.ID, &student.Name, &student.Age); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	*/
-	//
-	var student Student
-	if err := db.First(&student, studentID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"message": "No this student"})
 		return
 	}
 	c.JSON(http.StatusOK, student)
@@ -138,33 +198,30 @@ func GetStudentById(c *gin.Context) {
 
 func UpdataStudent(c *gin.Context) {
 	var student Student
+	studentID := JudgeId(c)
+	if studentID == 0 {
+		return
+	}
+
 	if err := c.BindJSON(&student); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "wrong updata"})
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Failed to bind JSON"})
 		return
 	}
-	studentID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "invalid student ID"})
-		return
-	}
-	/*
-		_, err = Mysqldb.Exec("UPDATE students SET name=?, age=? WHERE id=?", student.Name, student.Age, studentID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-	*/
+	//更新MySQL中的数据
 	if err := db.Model(&student).Where("id = ?", studentID).Updates(Student{Name: student.Name, Age: student.Age}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		HandleError(c, err, "Failed to update student in database")
+		return
+	}
+	//删去缓存
+	if err := DeletRedis(c); err != nil {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "successfully updated"})
 }
 
 func DeleteStudent(c *gin.Context) {
-	studentID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid student ID"})
+	studentID := JudgeId(c)
+	if studentID == 0 {
 		return
 	}
 
@@ -177,15 +234,12 @@ func DeleteStudent(c *gin.Context) {
 	c.Set("student", student) // 将学生信息存储到 Gin 上下文中
 	student = c.MustGet("student").(Student)
 	if err := db.Delete(&student).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		HandleError(c, err, "Failed to delete student")
 		return
 	}
-	/*
-		studentID, _ := strconv.Atoi(c.Param("id"))
-		_, err := Mysqldb.Exec("DELETE FROM students WHERE id=?", studentID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}*/
+	//删去缓存
+	if err := DeletRedis(c); err != nil {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "successfully deleted"})
 }
