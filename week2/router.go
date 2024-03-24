@@ -19,6 +19,7 @@ func SetupRouter() *gin.Engine {
 	apiGroup.PUT("/student/:id", UpdataStudent)
 	// 删除学生信息
 	apiGroup.DELETE("/student/:id", DeleteStudent)
-
+	// 对照组
+	apiGroup.GET("/dbstudent/:id", GetStudentDB)
 	return router
 }

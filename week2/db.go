@@ -84,7 +84,12 @@ func AddToRedisCache(student *Student, id string) (*Student, error) {
 
 // 删除Redis中的缓存
 func DeletRedis(c *gin.Context) error {
-	if err := rdb.Del(context.Background(), c.Param("id")).Err(); err != nil {
+	err := rdb.Del(context.Background(), c.Param("id")).Err()
+	if err != nil {
+		// if err := SendMessage(c.Param("id")); err != nil {
+		// 	// 如果发送消息失败，则返回错误，但是仍然尝试删除缓存
+		// 	log.Printf("Failed to send message to queue: %v", err)
+		// }
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Failed to Delete data in Redis"})
 		return err
 	}
@@ -121,7 +126,6 @@ func InitDB() error {
 	Mysqldb.SetMaxOpenConns(64)
 	Mysqldb.SetMaxIdleConns(64)
 	Mysqldb.SetConnMaxLifetime(5 * time.Minute)
-
 	//初始化Redis连接池
 	rdb = redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
@@ -242,4 +246,15 @@ func DeleteStudent(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "successfully deleted"})
+}
+
+// 测试
+func GetStudentDB(c *gin.Context) {
+	id := c.Param("id")
+	student, err := FindInMysql(id, c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "未找到学生"})
+	} else {
+		c.JSON(http.StatusOK, student)
+	}
 }
